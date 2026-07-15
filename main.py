@@ -1,11 +1,13 @@
+import os
 from fastapi import FastAPI
 
 app = FastAPI()
+DATABASE_URL = os.environ.get("DATABASE_URL", "not set")
 
 @app.get("/")
 def read_root():
-    return {"status": "alive", "message": "Music graph API is running"}
+    return {"status": "alive"}
 
-@app.get("/health")
-def health_check():
-    return {"status": "ok"}
+@app.get("/db-check")
+def db_check():
+    return {"database_url_present": DATABASE_URL != "not set"}
