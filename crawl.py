@@ -44,7 +44,7 @@ def get_or_create_artist(cur, mbid, name):
     cur.execute("SELECT id FROM artists WHERE mbid = %s", (mbid,))
     row = cur.fetchone()
     if row:
-        return row[0]
+        return row[0], False  # existed already
     cur.execute(
         """
         INSERT INTO artists (mbid, name)
@@ -56,9 +56,9 @@ def get_or_create_artist(cur, mbid, name):
     )
     row = cur.fetchone()
     if row:
-        return row[0]
+        return row[0], True  # newly created
     cur.execute("SELECT id FROM artists WHERE mbid = %s", (mbid,))
-    return cur.fetchone()[0]
+    return cur.fetchone()[0], False
 
 
 def insert_edge(cur, from_id, to_id, rel_type):
@@ -67,9 +67,11 @@ def insert_edge(cur, from_id, to_id, rel_type):
         INSERT INTO collaborations (artist_a_id, artist_b_id, relationship_type, source)
         VALUES (%s, %s, %s, 'musicbrainz')
         ON CONFLICT (artist_a_id, artist_b_id, relationship_type) DO NOTHING
+        RETURNING id
         """,
         (from_id, to_id, rel_type),
     )
+    return cur.fetchone() is not None  # True if a new row was actually inserted
 
 
 def insert_alias(cur, alias_name, canonical_id):
