@@ -1,65 +1,30 @@
 """
-Breadth-first crawler that grows the artist collaboration graph outward
-from a small set of seed artists, up to a maximum depth and a total
-artist cap (the cap matters as much as the depth -- branching factor
-can make even depth 3 explode into thousands of API calls).
-
-Follows MusicBrainz API etiquette (same as fetch_musicbrainz.py):
-- musicbrainzngs sets a proper User-Agent
-- musicbrainzngs auto rate-limits to 1 request/second
-- one-off manual run, not scheduled polling
-
-Key difference from fetch_musicbrainz.py: past the initial seeds, every
-artist discovered comes from a relation's own MusicBrainz ID (mbid) --
-an exact identifier straight from the API, not a text search. This is
-what avoids the "Frank Sinatra instead of Frank Ocean" bug entirely for
-anything the crawler discovers on its own; fuzzy text search is only
-needed once, to resolve the handful of seed names you type in.
+Same BFS crawler as crawl_musicbrainz.py, refactored into an importable
+function so it can be triggered from the API with artist names supplied
+at request time, instead of editing a hardcoded SEED_ARTISTS list and
+rerunning the script by hand.
 """
 
-import os
 import musicbrainzngs
-import psycopg2
 
-MAX_DEPTH = 3
-MAX_ARTISTS = 300  # safety cap -- stop even if depth hasn't been reached
+MAX_DEPTH_DEFAULT = 2
+MAX_ARTISTS_DEFAULT = 50  # kept modest -- this runs synchronously inside
+                          # a web request, at 1 request/second
 
-# REQUIRED by MusicBrainz's API rules: identify your app and give them a
-# way to reach you. Swap in your actual GitHub repo URL or email.
 musicbrainzngs.set_useragent(
     "RiffRelay",
     "0.1",
     "https://github.com/beansprout214/riff_relay",
 )
 
-SEED_ARTISTS = [
-    "Frank Ocean",
-    "Tyler, The Creator",
-    "Alex Turner",
-]
-
 IDENTITY_RELATION_TYPES = {"is person", "legal name"}
-
-# Personal/biographical relations aren't musical collaborations -- we
-# skip them so the crawler doesn't wander into family trees or fan
-# tribute acts instead of real musical connections.
 EXCLUDED_RELATION_TYPES = {
     "tribute", "named after artist", "involved with",
     "married", "parent", "sibling", "teacher", "founder",
 }
 
 
-def get_connection():
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        raise RuntimeError(
-            "DATABASE_URL not set. export DATABASE_URL='<your public connection string>'"
-        )
-    return psycopg2.connect(db_url)
-
-
 def search_seed_mbid(name):
-    """Text search -- only used for the handful of typed-in seed names."""
     result = musicbrainzngs.search_artists(artist=name, limit=5, strict=True)
     matches = result.get("artist-list", [])
     if not matches:
@@ -76,10 +41,6 @@ def fetch_relations(mbid):
 
 
 def get_or_create_artist(cur, mbid, name):
-    """mbid is the real identity key. If a row with this mbid already
-    exists we reuse it, regardless of what name string shows up this
-    time -- this is what makes duplicate-name cases (like the two
-    'Jamie Cook' entries we saw) resolve correctly instead of guessing."""
     cur.execute("SELECT id FROM artists WHERE mbid = %s", (mbid,))
     row = cur.fetchone()
     if row:
@@ -122,37 +83,39 @@ def insert_alias(cur, alias_name, canonical_id):
     )
 
 
-def crawl():
-    conn = get_connection()
+def crawl(conn, seed_names, max_depth=MAX_DEPTH_DEFAULT, max_artists=MAX_ARTISTS_DEFAULT):
+    """Runs a BFS crawl from the given seed artist names, inserting
+    everything it finds into the given Postgres connection. Returns a
+    summary dict -- useful for an API response so the caller sees what
+    actually happened.
+    """
     cur = conn.cursor()
 
-    queue = []  # (mbid, name, depth)
+    queue = []
     visited_mbids = set()
+    unresolved_seeds = []
 
-    print("Resolving seed artists...")
-    for name in SEED_ARTISTS:
+    for name in seed_names:
         found = search_seed_mbid(name)
         if not found:
-            print(f"  no match for seed '{name}'")
+            unresolved_seeds.append(name)
             continue
         mbid, canonical_name = found
         get_or_create_artist(cur, mbid, canonical_name)
         conn.commit()
         queue.append((mbid, canonical_name, 0))
-        print(f"  seed: {canonical_name} ({mbid})")
 
     artists_crawled = 0
+    edges_found = 0
 
-    while queue and artists_crawled < MAX_ARTISTS:
+    while queue and artists_crawled < max_artists:
         mbid, name, depth = queue.pop(0)
-
         if mbid in visited_mbids:
             continue
         visited_mbids.add(mbid)
 
         from_id = get_or_create_artist(cur, mbid, name)
         artists_crawled += 1
-        print(f"[{artists_crawled}/{MAX_ARTISTS}] depth={depth} crawling: {name}")
 
         relations = fetch_relations(mbid)
         for rel in relations:
@@ -174,18 +137,16 @@ def crawl():
             to_id = get_or_create_artist(cur, target_mbid, target_name)
             insert_edge(cur, from_id, to_id, rel_type)
             conn.commit()
+            edges_found += 1
 
-            # Stop growing the frontier past MAX_DEPTH -- we still
-            # record the edge into this artist (above), we just don't
-            # go on to crawl THEIR relations.
-            if depth + 1 <= MAX_DEPTH and target_mbid not in visited_mbids:
+            if depth + 1 <= max_depth and target_mbid not in visited_mbids:
                 queue.append((target_mbid, target_name, depth + 1))
 
     cur.close()
-    conn.close()
-    print(f"\nDone. Crawled {artists_crawled} artists "
-          f"(stopped at depth {MAX_DEPTH} or the {MAX_ARTISTS}-artist cap, whichever came first).")
-
-
-if __name__ == "__main__":
-    crawl()
+    return {
+        "artists_crawled": artists_crawled,
+        "edges_found": edges_found,
+        "unresolved_seeds": unresolved_seeds,
+        "max_depth": max_depth,
+        "max_artists": max_artists,
+    }
